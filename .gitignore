@@ -1,0 +1,6 @@
+# Local deployment configuration (copy scripts/config.dist.gs to
+# scripts/config.gs and fill in)
+scripts/config.gs
+
+# macOS
+.DS_Store
