@@ -31,7 +31,7 @@
 var RCONFIG = {
   SHEET_NAME: 'AllJobs',
   REPORT_SHEET: 'Reconciliation',
-  COL: { NAME: 1, INVOICED: 12, JIRA: 13, MONTH: 17 }  // A, L, M, Q
+  COL: { NAME: 1, EST: 7, INVOICED: 12, JIRA: 13, MONTH: 17 }  // A, G, L, M, Q
 };
 
 /* ============================ STEP 1: RECONCILE ============================ */
@@ -77,6 +77,7 @@ function reconcileInvoices() {
   var sheet = SpreadsheetApp.getActive().getSheetByName(RCONFIG.SHEET_NAME);
   var last = lastDataRow_(sheet);
   var names = sheet.getRange(2, RCONFIG.COL.NAME, last - 1).getValues();
+  var ests  = sheet.getRange(2, RCONFIG.COL.EST, last - 1).getValues();
   var invs  = sheet.getRange(2, RCONFIG.COL.INVOICED, last - 1).getValues();
   var jiras = sheet.getRange(2, RCONFIG.COL.JIRA, last - 1).getDisplayValues();
   var months = sheet.getRange(2, RCONFIG.COL.MONTH, last - 1).getDisplayValues();
@@ -84,7 +85,7 @@ function reconcileInvoices() {
   for (var i = 0; i < names.length; i++) {
     var rowMonth = String(months[i][0]).trim();
     if (rowMonth !== monthKey && rowMonth !== '') continue;  // this month + not-yet-invoiced rows
-    rows.push({ row: i + 2, name: String(names[i][0]), inv: invs[i][0],
+    rows.push({ row: i + 2, name: String(names[i][0]), inv: invs[i][0], est: ests[i][0],
                 jira: (String(jiras[i][0]).match(ticketRe) || [''])[0],
                 monthSet: rowMonth === monthKey, used: false });
   }
@@ -227,22 +228,41 @@ function matchInvoice_(v, rows) {
     return String(s).toLowerCase().replace(/[^a-z0-9#\/-]+/g, ' ').split(' ')
       .filter(function (t) { return t.length > 1 && !stop[t] && !/^cc\d+$/.test(t); });
   }
-  var st = toks(v.subject);
+  // expand number ranges like "#104-106" so #104, #105 and #106 all match
+  var subject = String(v.subject).replace(/#(\d+)\s*[-–]\s*(\d+)/g, function (m, a, b) {
+    var from = parseInt(a, 10), to = parseInt(b, 10), out = [];
+    if (to <= from || to - from > 50) return m;
+    for (var n = from; n <= to; n++) out.push('#' + n);
+    return out.join(' ');
+  });
+  var st = toks(subject);
   var scored = free.map(function (r) {
     var rt = toks(r.name), n = 0;
     rt.forEach(function (t) { if (st.indexOf(t) >= 0) n++; });
-    return { r: r, score: n };
-  }).filter(function (x) { return x.score >= 2; })
+    // a numbered token like "#61" identifies the job — a row only matches
+    // if all its numbered tokens appear in the (expanded) subject
+    var hashOk = rt.every(function (t) { return !/^#\d+$/.test(t) || st.indexOf(t) >= 0; });
+    return { r: r, score: n, frac: rt.length ? n / rt.length : 0, hashOk: hashOk };
+  }).filter(function (x) { return x.score >= 2 && x.frac >= 0.5 && x.hashOk; })
     .sort(function (a, b) { return b.score - a.score; });
   if (!scored.length && exact.length > 1) return [exact[0]]; // amount ties: take first, human reviews
   if (!scored.length) return [];
   var hits = [scored[0].r];
-  // 3) bundle: pull in additional scoring rows while sum of filled values < total
+  // 3) bundle: add further matching rows only while the invoice total is not
+  //    yet covered — by invoiced amounts, or by estimates on empty rows
+  //    (invoices can exceed estimates through minimum charges, so a single
+  //    strong match is kept even when its estimate falls short)
+  function covered_() {
+    var sum = 0, usable = true;
+    hits.forEach(function (h) {
+      var val = (typeof h.inv === 'number') ? h.inv : (typeof h.est === 'number' ? h.est : null);
+      if (val === null) usable = false; else sum += val;
+    });
+    return usable && sum >= v.total * 0.98;
+  }
   for (var i = 1; i < scored.length; i++) {
-    var sum = hits.reduce(function (s, h) { return s + (typeof h.inv === 'number' ? h.inv : 0); }, 0);
-    var anyEmpty = hits.some(function (h) { return h.inv === '' || h.inv === null; });
-    if (!anyEmpty && Math.abs(sum - v.total) < 0.01) break;
-    if (scored[i].score >= 2) hits.push(scored[i].r);
+    if (covered_()) break;
+    hits.push(scored[i].r);
   }
   return hits;
 }
