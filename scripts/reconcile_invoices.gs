@@ -186,9 +186,9 @@ function applyReconciliation() {
 // PDF -> text via Drive conversion (needs Advanced Drive Service v2 enabled)
 // Waits and retries when Google's OCR rate limit pushes back.
 function pdfToText_(file) {
-  Utilities.sleep(2000);  // gentle pacing between files
+  Utilities.sleep(10000);  // gentle pacing between files
   var res = null;
-  for (var attempt = 1; attempt <= 5; attempt++) {
+  for (var attempt = 1; attempt <= 6; attempt++) {
     try {
       res = Drive.Files.insert(
         { title: 'tmp-ocr-' + file.getName() },
@@ -196,8 +196,8 @@ function pdfToText_(file) {
         { ocr: true, ocrLanguage: 'en' });
       break;  // success
     } catch (e) {
-      if (String(e).indexOf('rate limit') === -1 || attempt === 5) throw e;
-      Utilities.sleep(10000 * attempt);  // wait longer each retry: 10s, 20s, 30s…
+      if (String(e).indexOf('rate limit') === -1 || attempt === 6) throw e;
+      Utilities.sleep(20000 * attempt);  // wait longer each retry: 20s, 40s, 60s…
     }
   }
   var text = DocumentApp.openById(res.id).getBody().getText();
