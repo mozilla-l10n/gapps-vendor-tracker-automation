@@ -98,7 +98,10 @@ function syncFromJira() {
     ui.alert('Jira error ' + resp.getResponseCode(), resp.getContentText().slice(0, 300), ui.ButtonSet.OK);
     return;
   }
-  var issues = JSON.parse(resp.getContentText()).issues || [];
+  var parsed = JSON.parse(resp.getContentText());
+  var issues = parsed.issues || [];
+  // loud guard: Jira pages its results — warn instead of silently truncating
+  var truncated = !!parsed.nextPageToken;
 
   // --- 4. Diff: append new rows, update tracked rows from Jira ---
   var added = [], skipped = [], updated = [], nameFlags = [], alreadyTracked = 0;
@@ -177,7 +180,9 @@ function syncFromJira() {
   });
 
   // --- 5. Report: every change is visible, nothing moves silently ---
-  var msg = 'Checked ' + issues.length + ' ticket(s).\n\n' +
+  var msg = (truncated ? 'WARNING: Jira has more tickets than the ' + issues.length +
+             ' checked here — the list was cut off. Time to add pagination to this script.\n\n' : '') +
+            'Checked ' + issues.length + ' ticket(s).\n\n' +
             'Added: ' + (added.length ? '\n  • ' + added.join('\n  • ') : 'none') + '\n' +
             'Already tracked: ' + alreadyTracked + '\n' +
             (updated.length ? 'Updated from Jira:\n  • ' + updated.join('\n  • ') + '\n' : '') +
