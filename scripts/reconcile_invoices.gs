@@ -93,6 +93,11 @@ function reconcileInvoices() {
   // --- match each invoice to row(s) ---
   var report = [];
   invoices.forEach(function (v) {
+    if (typeof v.total !== 'number') {   // total could not be read from the PDF
+      report.push([false, v.oc, '', v.subject.slice(0, 90), '', '',
+                   'TOTAL NOT READABLE — check the PDF by hand', '']);
+      return;
+    }
     var hits = matchInvoice_(v, rows);
     var sum = hits.reduce(function (s, h) { return s + (typeof h.inv === 'number' ? h.inv : 0); }, 0);
     var allFilled = hits.length && hits.every(function (h) { return h.inv !== '' && h.inv !== null; });
@@ -100,6 +105,7 @@ function reconcileInvoices() {
     if (!hits.length)                    { status = 'NO MATCH — review';        check = false; }
     else if (allFilled && Math.abs(sum - v.total) < 0.01) { status = 'VERIFIED (already filled, amounts agree)'; check = true; }
     else if (allFilled)                  { status = 'MISMATCH: tracker has ' + sum.toFixed(2); check = false; }
+    else if (sum > v.total + 0.01)       { status = 'MISMATCH: filled rows already exceed invoice (' + sum.toFixed(2) + ')'; check = false; }
     else                                 { status = 'FILL (tracker empty)';     check = true; }
     hits.forEach(function (h) { h.used = true; });
     report.push([check, v.oc, v.total, v.subject.slice(0, 90),
@@ -118,8 +124,9 @@ function reconcileInvoices() {
   rep.getRange(1, 1, 1, 8).setValues([['Apply?', 'Invoice', 'Amount', 'Invoice subject', 'Row(s)', 'Tracker job(s)', 'Status', 'Jira ticket(s)']]).setFontWeight('bold');
   rep.getRange(1, 10).setValue('Month: ' + monthKey);
   if (report.length) {
-    rep.getRange(2, 1, report.length, 8).setValues(report);
+    // checkboxes first, values second — so the computed ticks are kept
     rep.getRange(2, 1, report.length, 1).insertCheckboxes();
+    rep.getRange(2, 1, report.length, 8).setValues(report);
   }
   if (leftovers.length) {
     rep.getRange(report.length + 3, 2).setValue('Tracker rows for ' + monthKey + ' not covered by any invoice:');
@@ -141,10 +148,15 @@ function applyReconciliation() {
   var data = rep.getRange(2, 1, Math.max(rep.getLastRow() - 1, 1), 8).getValues();
   var ticketRe = new RegExp(JIRA_PROJECT + '-\\d+');
 
-  var filled = 0, jiraOk = 0, jiraFlags = [];
+  var filled = 0, jiraOk = 0, jiraFlags = [], notApplied = [];
   data.forEach(function (line) {
     if (line[0] !== true || !line[4]) return;           // unchecked or no rows
     var total = line[2];
+    // never apply a line without a readable amount (e.g. TOTAL NOT READABLE)
+    if (typeof total !== 'number') {
+      notApplied.push(line[1] + ': no readable amount — nothing written');
+      return;
+    }
     var rowNums = String(line[4]).split(',').map(function (s) { return parseInt(s.trim(), 10); }).filter(Boolean);
 
     // --- fill tracker: first empty row gets the remainder, other empty rows get 0 ---
@@ -153,11 +165,18 @@ function applyReconciliation() {
       var v = sheet.getRange(r, RCONFIG.COL.INVOICED).getValue();
       if (typeof v === 'number') already += v;
     });
+    // never write a negative remainder: filled rows exceeding the invoice is a
+    // conflict for a human to resolve, not a gap to fill
+    var remainder = Math.round((total - already) * 100) / 100;
+    if (remainder < 0) {
+      notApplied.push(line[1] + ': filled rows exceed the invoice by ' + (-remainder).toFixed(2) + ' — nothing written');
+      return;
+    }
     var first = true;
     rowNums.forEach(function (r) {
       var cell = sheet.getRange(r, RCONFIG.COL.INVOICED);
       if (cell.getValue() === '' || cell.getValue() === null) {
-        cell.setValue(first ? Math.round((total - already) * 100) / 100 : 0);
+        cell.setValue(first ? remainder : 0);
         first = false; filled++;
       }
       var mCell = sheet.getRange(r, RCONFIG.COL.MONTH);
@@ -178,6 +197,7 @@ function applyReconciliation() {
 
   ui.alert('Apply done',
     'Tracker cells filled: ' + filled + '\nJira tickets updated/verified: ' + jiraOk +
+    (notApplied.length ? '\nNot applied (review needed):\n  • ' + notApplied.join('\n  • ') : '') +
     (jiraFlags.length ? '\nJira flags:\n  • ' + jiraFlags.join('\n  • ') : ''),
     ui.ButtonSet.OK);
 }
