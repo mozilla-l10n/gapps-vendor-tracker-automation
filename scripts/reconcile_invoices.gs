@@ -9,11 +9,18 @@
  *   line per invoice with a checkbox — pre-ticked for clean matches,
  *   unticked with a written reason for anything doubtful. The tab is
  *   a scratchpad: each run overwrites it.
+ *   Parsed PDF data is stored in a <month>.json file next to the
+ *   PDFs (GitHub issue #1), so an unchanged invoice is converted
+ *   at most once in its life. Delete that JSON file in Drive to
+ *   force a full re-read of the month.
  *   "Apply reconciliation" acts only on ticked lines: fills empty
  *   Invoiced + Invoice Month cells (never overwrites), and writes
  *   the amount to the Jira ticket's invoiced field — filling empty
  *   tickets, verifying matching ones, flagging (not changing) any
- *   that disagree. On months already filled by hand, the same run
+ *   that disagree. $0 bundle rows get a note pointing at the row
+ *   that carries the amount. Matches made from word overlap alone
+ *   (no # number, no full name match, no amount agreement) are
+ *   never pre-ticked. On months already filled by hand, the same run
  *   verifies PDF ↔ sheet ↔ Jira and surfaces mismatches.
  *
  * Setup (once, in addition to the sync script's setup):
@@ -31,7 +38,7 @@
 var RCONFIG = {
   SHEET_NAME: 'AllJobs',
   REPORT_SHEET: 'Reconciliation',
-  COL: { NAME: 1, EST: 7, INVOICED: 12, JIRA: 13, MONTH: 17 }  // A, G, L, M, Q
+  COL: { NAME: 1, EST: 7, INVOICED: 12, JIRA: 13, NOTE: 14, MONTH: 17 }  // A, G, L, M, N, Q
 };
 
 /* ============================ STEP 1: RECONCILE ============================ */
@@ -55,12 +62,40 @@ function reconcileInvoices() {
   }
   if (!monthFolder) { ui.alert('No folder starting with "' + mm + '-" found in the ' + INVOICE_YEAR + ' invoice folder.'); return; }
 
-  // --- read + parse every OC-*.pdf ---
+  // --- load the month's parse memory (<month>.json next to the PDFs) ---
+  // Every successfully read PDF is stored there and never converted again.
+  // Delete the JSON file in the Drive folder to re-read everything.
+  var cacheName = monthKey + '.json';
+  var cacheFile = null, cache = { files: {} };
+  var cacheIt = monthFolder.getFilesByName(cacheName);
+  if (cacheIt.hasNext()) {
+    cacheFile = cacheIt.next();
+    try { cache = JSON.parse(cacheFile.getBlob().getDataAsString()) || { files: {} }; }
+    catch (e) { cache = { files: {} }; }
+    if (!cache.files) cache.files = {};
+  }
+
+  // --- read every OC-*.pdf: stored data when unchanged, conversion only when new ---
   var files = monthFolder.getFiles(), invoices = [];
+  var fromCache = 0, parsedNew = 0, failed = [];
   while (files.hasNext()) {
     var file = files.next();
-    if (!/^OC-.*\.pdf$/i.test(file.getName())) continue;
-    var text = pdfToText_(file);
+    var fname = file.getName();
+    if (!/^OC-.*\.pdf$/i.test(fname)) continue;
+    var modified = file.getLastUpdated().toISOString();
+    var entry = cache.files[fname];
+    if (entry && entry.updated === modified) {   // unchanged since last run
+      invoices.push({ oc: fname.replace(/\.pdf$/i, ''), subject: entry.subject, total: entry.total });
+      fromCache++;
+      continue;
+    }
+    var text;
+    try {
+      text = pdfToText_(file);
+    } catch (e) {   // Google's limit: keep partial progress, next run reads only these
+      failed.push(fname);
+      continue;
+    }
     var subject = (text.match(/Subject\s*\n([\s\S]*?)\n\s*\n?\s*Items/) || [,'???'])[1].replace(/\s+/g, ' ').trim();
     var totalM = text.match(/Total price without (?:VAT|tax)\s+([\d,]+\.\d{2})/);
     var total = totalM ? parseFloat(totalM[1].replace(/,/g, '')) : null;
@@ -68,9 +103,18 @@ function reconcileInvoices() {
     subject = subject.replace(/\b(1[67]\d{11})\b/g, function (m) {
       return Utilities.formatDate(new Date(parseInt(m, 10)), 'UTC', 'yyyy-MM-dd');
     });
-    invoices.push({ oc: file.getName().replace(/\.pdf$/i, ''), subject: subject, total: total });
+    invoices.push({ oc: fname.replace(/\.pdf$/i, ''), subject: subject, total: total });
+    cache.files[fname] = { updated: modified, subject: subject, total: total };
+    parsedNew++;
+    // save after every file, so a timeout mid-run loses nothing
+    cacheFile = saveCache_(monthFolder, cacheFile, cacheName, cache);
   }
-  if (!invoices.length) { ui.alert('No OC-*.pdf files found in ' + monthFolder.getName() + '.'); return; }
+  if (!invoices.length) {
+    ui.alert(failed.length
+      ? 'Google\'s conversion limit blocked all ' + failed.length + ' PDF(s). Run again later — progress is kept between runs.'
+      : 'No OC-*.pdf files found in ' + monthFolder.getName() + '.');
+    return;
+  }
   invoices.sort(function (a, b) { return a.oc < b.oc ? -1 : 1; });
 
   // --- load this month's AllJobs rows ---
@@ -101,11 +145,13 @@ function reconcileInvoices() {
     var hits = matchInvoice_(v, rows);
     var sum = hits.reduce(function (s, h) { return s + (typeof h.inv === 'number' ? h.inv : 0); }, 0);
     var allFilled = hits.length && hits.every(function (h) { return h.inv !== '' && h.inv !== null; });
+    var weak = hits.some(function (h) { return h.weak; });
     var status, check;
     if (!hits.length)                    { status = 'NO MATCH — review';        check = false; }
     else if (allFilled && Math.abs(sum - v.total) < 0.01) { status = 'VERIFIED (already filled, amounts agree)'; check = true; }
     else if (allFilled)                  { status = 'MISMATCH: tracker has ' + sum.toFixed(2); check = false; }
     else if (sum > v.total + 0.01)       { status = 'MISMATCH: filled rows already exceed invoice (' + sum.toFixed(2) + ')'; check = false; }
+    else if (weak)                       { status = 'FILL (words-only match — check the row)'; check = false; }
     else                                 { status = 'FILL (tracker empty)';     check = true; }
     hits.forEach(function (h) { h.used = true; });
     report.push([check, v.oc, v.total, v.subject.slice(0, 90),
@@ -116,6 +162,12 @@ function reconcileInvoices() {
   });
   var leftovers = rows.filter(function (r) { return !r.used && r.monthSet; })
                       .map(function (r) { return r.name.slice(0, 60); });
+
+  // PDFs blocked by Google's limit appear in the report too, never ticked
+  failed.sort().forEach(function (n) {
+    report.push([false, n.replace(/\.pdf$/i, ''), '', '', '', '',
+                 'NOT READ (Google limit) — run again later', '']);
+  });
 
   // --- write the report tab ---
   var ss = SpreadsheetApp.getActive();
@@ -133,7 +185,11 @@ function reconcileInvoices() {
     rep.getRange(report.length + 4, 2, leftovers.length).setValues(leftovers.map(function (n) { return [n]; }));
   }
   ss.setActiveSheet(rep);
-  ui.alert('Reconciliation ready', report.length + ' invoice(s) processed.\nReview the Reconciliation tab, tick/untick the Apply boxes, then run "Apply reconciliation".', ui.ButtonSet.OK);
+  ui.alert('Reconciliation ready',
+    report.length + ' invoice(s): ' + fromCache + ' from stored data, ' + parsedNew + ' newly read' +
+    (failed.length ? ', ' + failed.length + ' NOT read (Google limit) — run again later' : '') + '.\n' +
+    'Review the Reconciliation tab, tick/untick the Apply boxes, then run "Apply reconciliation".',
+    ui.ButtonSet.OK);
 }
 
 /* ============================ STEP 2: APPLY ============================ */
@@ -148,7 +204,7 @@ function applyReconciliation() {
   var data = rep.getRange(2, 1, Math.max(rep.getLastRow() - 1, 1), 8).getValues();
   var ticketRe = new RegExp(JIRA_PROJECT + '-\\d+');
 
-  var filled = 0, jiraOk = 0, jiraFlags = [], notApplied = [];
+  var filled = 0, jiraOk = 0, jiraFlags = [], notApplied = [], notesAdded = 0;
   data.forEach(function (line) {
     if (line[0] !== true || !line[4]) return;           // unchecked or no rows
     var total = line[2];
@@ -172,11 +228,12 @@ function applyReconciliation() {
       notApplied.push(line[1] + ': filled rows exceed the invoice by ' + (-remainder).toFixed(2) + ' — nothing written');
       return;
     }
-    var first = true;
+    var first = true, mainRow = null;
     rowNums.forEach(function (r) {
       var cell = sheet.getRange(r, RCONFIG.COL.INVOICED);
       if (cell.getValue() === '' || cell.getValue() === null) {
-        cell.setValue(first ? remainder : 0);
+        if (first) { cell.setValue(remainder); mainRow = r; }
+        else { cell.setValue(0); notesAdded += noteBundle_(sheet, r, line[1], mainRow); }
         first = false; filled++;
       }
       var mCell = sheet.getRange(r, RCONFIG.COL.MONTH);
@@ -197,12 +254,34 @@ function applyReconciliation() {
 
   ui.alert('Apply done',
     'Tracker cells filled: ' + filled + '\nJira tickets updated/verified: ' + jiraOk +
+    (notesAdded ? '\nBundle notes added: ' + notesAdded : '') +
     (notApplied.length ? '\nNot applied (review needed):\n  • ' + notApplied.join('\n  • ') : '') +
     (jiraFlags.length ? '\nJira flags:\n  • ' + jiraFlags.join('\n  • ') : ''),
     ui.ButtonSet.OK);
 }
 
 /* ============================ HELPERS ============================ */
+
+// Mark a $0 bundle row so the empty-looking amount explains itself.
+// Fills an empty note or appends; never replaces what a human wrote.
+function noteBundle_(sheet, row, oc, mainRow) {
+  var cell = sheet.getRange(row, RCONFIG.COL.NOTE);
+  var cur = String(cell.getDisplayValue()).trim();
+  var note = 'Invoiced under ' + oc + ' bundle, see row ' + mainRow;
+  if (cur.indexOf(note) >= 0) return 0;   // already there
+  cell.setValue(cur === '' ? note : cur + ' — ' + note);
+  return 1;
+}
+
+// Write the month's parse memory next to the PDFs (readable JSON).
+// Deleting this file in Drive forces a full re-read of the month.
+function saveCache_(folder, file, name, cache) {
+  cache.comment = 'Parsed invoice data used by reconcile_invoices. Delete this file to re-read all PDFs from scratch.';
+  cache.updated = new Date().toISOString();
+  var json = JSON.stringify(cache, null, 2);
+  if (file) { file.setContent(json); return file; }
+  return folder.createFile(name, json, 'application/json');
+}
 
 // PDF -> text via Drive conversion (needs Advanced Drive Service v2 enabled)
 // Waits and retries when Google's OCR rate limit pushes back.
@@ -239,7 +318,7 @@ function matchInvoice_(v, rows) {
   var free = rows.filter(function (r) { return !r.used; });
   // 1) unique exact amount match on a filled row
   var exact = free.filter(function (r) { return typeof r.inv === 'number' && Math.abs(r.inv - v.total) < 0.01; });
-  if (exact.length === 1) return exact;
+  if (exact.length === 1) { exact[0].weak = false; return exact; }   // amount agreement = confident
   // 2) token matching against subject (cost centers, year, quarters and
   //    filler words carry no signal, so they are excluded)
   var stop = { 'the': 1, 'for': 1, 'and': 1, 'q1': 1, 'q2': 1, 'q3': 1, 'q4': 1 };
@@ -262,11 +341,16 @@ function matchInvoice_(v, rows) {
     // a numbered token like "#61" identifies the job — a row only matches
     // if all its numbered tokens appear in the (expanded) subject
     var hashOk = rt.every(function (t) { return !/^#\d+$/.test(t) || st.indexOf(t) >= 0; });
-    return { r: r, score: n, frac: rt.length ? n / rt.length : 0, hashOk: hashOk };
+    // confident = identified by its # number, or every word of the row name
+    // appears in the subject; anything less is a words-only guess
+    var hashNamed = rt.some(function (t) { return /^#\d+$/.test(t) && st.indexOf(t) >= 0; });
+    return { r: r, score: n, frac: rt.length ? n / rt.length : 0, hashOk: hashOk,
+             confident: hashNamed || (rt.length > 0 && n === rt.length) };
   }).filter(function (x) { return x.score >= 2 && x.frac >= 0.5 && x.hashOk; })
     .sort(function (a, b) { return b.score - a.score; });
-  if (!scored.length && exact.length > 1) return [exact[0]]; // amount ties: take first, human reviews
+  if (!scored.length && exact.length > 1) { exact[0].weak = true; return [exact[0]]; } // amount tie: human reviews
   if (!scored.length) return [];
+  scored[0].r.weak = !scored[0].confident;
   var hits = [scored[0].r];
   // 3) bundle: add further matching rows only while the invoice total is not
   //    yet covered — by invoiced amounts, or by estimates on empty rows
@@ -282,6 +366,7 @@ function matchInvoice_(v, rows) {
   }
   for (var i = 1; i < scored.length; i++) {
     if (covered_()) break;
+    scored[i].r.weak = !scored[i].confident;
     hits.push(scored[i].r);
   }
   return hits;
